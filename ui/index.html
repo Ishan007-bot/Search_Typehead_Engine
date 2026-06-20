@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Search Typeahead</title>
+  <style>
+    :root {
+      --ground:   #F7F5F0;   /* warm paper */
+      --surface:  #FFFFFF;   /* raised cards */
+      --ink:      #1C1B19;   /* near-black text */
+      --ink-soft: #6B6862;   /* muted text */
+      --line:     #E4E0D8;   /* hairline borders */
+      --line-2:   #D8D3C8;
+      --accent:   #E5484D;   /* signal red — search / hot */
+      --accent-d: #C13238;
+      --teal:     #2B7A6F;   /* popularity / data */
+      --teal-soft:#E3F0ED;
+      --good:     #2B7A6F;
+      --bad:      #C13238;
+      --r:        14px;
+      --r-sm:     9px;
+      --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+      --sans: "Space Grotesk", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, system-ui, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    html { -webkit-text-size-adjust: 100%; }
+    body {
+      margin: 0;
+      font-family: var(--sans);
+      background:
+        radial-gradient(900px 500px at 85% -5%, rgba(229,72,77,.05), transparent 60%),
+        radial-gradient(700px 500px at 10% 110%, rgba(43,122,111,.05), transparent 60%),
+        var(--ground);
+      color: var(--ink);
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      padding: 56px 20px 40px;
+      line-height: 1.5;
+    }
+    .app { width: 100%; max-width: 660px; }
+
+    /* ---- Header ---- */
+    header { margin-bottom: 26px; }
+    .eyebrow {
+      display: inline-flex; align-items: center; gap: 7px;
+      font-family: var(--mono); font-size: 11px; letter-spacing: .14em;
+      text-transform: uppercase; color: var(--ink-soft);
+      border: 1px solid var(--line-2); border-radius: 100px;
+      padding: 4px 11px 4px 9px; margin-bottom: 16px;
+    }
+    .eyebrow .dot {
+      width: 6px; height: 6px; border-radius: 50%; background: var(--accent);
+      box-shadow: 0 0 0 3px rgba(229,72,77,.18);
+    }
+    header h1 {
+      margin: 0; font-size: clamp(30px, 6vw, 42px); font-weight: 600;
+      letter-spacing: -0.03em; line-height: 1.04;
+    }
+    header h1 em { font-style: normal; color: var(--accent); }
+    header p {
+      margin: 12px 0 0; color: var(--ink-soft); font-size: 15px; max-width: 46ch;
+    }
+
+    /* ---- Search ---- */
+    .search-wrap { position: relative; margin-top: 8px; }
+    .search-box {
+      display: flex; align-items: center; gap: 12px;
+      background: var(--surface);
+      border: 1.5px solid var(--line-2);
+      border-radius: var(--r);
+      padding: 6px 6px 6px 18px;
+      box-shadow: 0 1px 2px rgba(28,27,25,.04);
+      transition: border-color .18s, box-shadow .18s, transform .18s;
+    }
+    .search-box:focus-within {
+      border-color: var(--accent);
+      box-shadow: 0 6px 22px rgba(229,72,77,.14), 0 0 0 4px rgba(229,72,77,.10);
+    }
+    .search-box > .lens { flex: none; color: var(--ink-soft); display: flex; }
+    .search-box:focus-within > .lens { color: var(--accent); }
+    #search-input {
+      flex: 1; min-width: 0; background: transparent; border: none; outline: none;
+      color: var(--ink); font-family: var(--sans); font-size: 17px; padding: 13px 0;
+      letter-spacing: -0.01em;
+    }
+    #search-input::placeholder { color: var(--ink-soft); opacity: .8; }
+    #search-btn {
+      flex: none; background: var(--accent); color: #fff; border: none;
+      padding: 12px 22px; border-radius: var(--r-sm); font-family: var(--sans);
+      font-size: 14px; font-weight: 600; cursor: pointer; letter-spacing: .01em;
+      transition: background .15s, transform .08s;
+    }
+    #search-btn:hover { background: var(--accent-d); }
+    #search-btn:active { transform: translateY(1px); }
+    #search-btn:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+
+    .spinner {
+      width: 17px; height: 17px; border: 2px solid var(--line-2);
+      border-top-color: var(--accent); border-radius: 50%;
+      animation: spin .6s linear infinite; display: none; flex: none;
+    }
+    .spinner.show { display: inline-block; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ---- Dropdown ---- */
+    .dropdown {
+      position: absolute; top: calc(100% + 8px); left: 0; right: 0;
+      background: var(--surface); border: 1px solid var(--line);
+      border-radius: var(--r); overflow: hidden; z-index: 10;
+      box-shadow: 0 18px 50px rgba(28,27,25,.16), 0 2px 6px rgba(28,27,25,.06);
+      display: none; transform-origin: top;
+    }
+    .dropdown.show { display: block; animation: drop .16s cubic-bezier(.2,.8,.2,1); }
+    @keyframes drop { from { opacity: 0; transform: translateY(-6px) scale(.99); } }
+
+    .dd-head {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 9px 16px; font-family: var(--mono); font-size: 11px;
+      letter-spacing: .08em; text-transform: uppercase; color: var(--ink-soft);
+      border-bottom: 1px solid var(--line); background: #FCFBF8;
+    }
+    .dd-head .src { display: inline-flex; align-items: center; gap: 6px; }
+    .dd-head .src b { color: var(--teal); font-weight: 600; }
+
+    .suggestion {
+      position: relative; display: grid;
+      grid-template-columns: 18px 1fr auto; align-items: center; gap: 12px;
+      padding: 12px 16px; cursor: pointer; font-size: 15.5px;
+      border-bottom: 1px solid var(--line);
+      transition: background .12s;
+    }
+    .suggestion:last-child { border-bottom: none; }
+    .suggestion:hover, .suggestion.active { background: #FBF3F3; }
+    .suggestion.active::before {
+      content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+      background: var(--accent);
+    }
+    .suggestion .ic { color: var(--ink-soft); display: flex; }
+    .suggestion:hover .ic, .suggestion.active .ic { color: var(--accent); }
+    .suggestion .label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .suggestion .label b { font-weight: 700; color: var(--ink); }
+    .suggestion .meta { display: flex; align-items: center; gap: 10px; }
+    /* popularity bar — the distinctive bit: ranking made visible */
+    .bar { width: 56px; height: 5px; border-radius: 4px; background: var(--line); overflow: hidden; }
+    .bar > i { display: block; height: 100%; background: var(--teal); border-radius: 4px; }
+    .suggestion .score {
+      font-family: var(--mono); font-size: 12px; color: var(--teal);
+      min-width: 38px; text-align: right; font-weight: 500;
+    }
+
+    .empty-hint {
+      padding: 22px 16px; color: var(--ink-soft); font-size: 14px; text-align: center;
+    }
+    .empty-hint b { color: var(--ink); font-weight: 600; }
+
+    /* ---- Banner ---- */
+    .banner {
+      margin-top: 18px; padding: 14px 16px; border-radius: var(--r);
+      font-size: 14.5px; display: none; align-items: center; gap: 11px;
+      border: 1px solid transparent;
+    }
+    .banner.show { display: flex; animation: drop .2s ease; }
+    .banner .mark {
+      width: 22px; height: 22px; border-radius: 50%; flex: none;
+      display: grid; place-items: center; color: #fff; font-size: 13px; font-weight: 700;
+    }
+    .banner.ok  { background: var(--teal-soft); border-color: #C5E2DB; color: #1d5650; }
+    .banner.ok  .mark { background: var(--good); }
+    .banner.err { background: #FBEAEA; border-color: #F1CBCC; color: #8f2226; }
+    .banner.err .mark { background: var(--bad); }
+    .banner b { font-weight: 700; }
+    .banner code { font-family: var(--mono); font-size: 13px; }
+
+    /* ---- Trending ---- */
+    .trending { margin-top: 40px; }
+    .trending h2 {
+      font-family: var(--mono); font-size: 11px; text-transform: uppercase;
+      letter-spacing: .12em; color: var(--ink-soft); margin: 0 0 14px;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .trending h2 .flame { color: var(--accent); display: flex; }
+    .chips { display: flex; flex-wrap: wrap; gap: 9px; }
+    .chip {
+      background: var(--surface); border: 1px solid var(--line-2);
+      padding: 9px 14px 9px 11px; border-radius: 100px; font-size: 14px; cursor: pointer;
+      display: inline-flex; align-items: center; gap: 9px;
+      transition: border-color .15s, background .15s, transform .08s;
+    }
+    .chip:hover { border-color: var(--accent); background: #FBF3F3; transform: translateY(-1px); }
+    .chip:active { transform: translateY(0); }
+    .chip .rank { font-family: var(--mono); color: var(--accent); font-weight: 600; font-size: 12px; }
+    .chip .tscore { font-family: var(--mono); color: var(--ink-soft); font-size: 11px; }
+    .trending .muted { color: var(--ink-soft); font-size: 14px; }
+
+    footer {
+      margin-top: 44px; padding-top: 18px; border-top: 1px solid var(--line);
+      display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center;
+      color: var(--ink-soft); font-size: 12.5px;
+    }
+    footer .grp { display: inline-flex; align-items: center; gap: 6px; }
+    kbd {
+      background: var(--surface); border: 1px solid var(--line-2);
+      border-bottom-width: 2px; border-radius: 6px; padding: 1px 7px;
+      font-family: var(--mono); font-size: 11px; color: var(--ink);
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before { animation: none !important; transition: none !important; }
+    }
+    @media (max-width: 480px) {
+      body { padding: 32px 14px; }
+      #search-btn { padding: 12px 16px; }
+      .bar { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <span class="eyebrow"><span class="dot"></span>Live · ranked by search volume</span>
+      <h1>Find it before you<br />finish <em>typing</em>.</h1>
+      <p>Start typing a product. Suggestions are ranked by how often shoppers search them.</p>
+    </header>
+
+    <div class="search-wrap">
+      <div class="search-box">
+        <span class="lens">
+          <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
+            <circle cx="11" cy="11" r="7" /><line x1="21" y1="21" x2="16.65" y2="16.65" />
+          </svg>
+        </span>
+        <input id="search-input" type="text" autocomplete="off" spellcheck="false"
+               placeholder="Try “iphone”, “laptop”, “headphones”…"
+               role="combobox" aria-expanded="false" aria-controls="dropdown" aria-autocomplete="list" />
+        <div class="spinner" id="spinner" aria-hidden="true"></div>
+        <button id="search-btn">Search</button>
+      </div>
+      <div class="dropdown" id="dropdown" role="listbox" aria-label="Search suggestions"></div>
+    </div>
+
+    <div class="banner" id="banner" role="status" aria-live="polite"></div>
+
+    <section class="trending">
+      <h2>
+        <span class="flame">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 2c1 4-2 5-2 8a4 4 0 0 0 8 0c0-2-1-3-1-3 2 1 3 3 3 6a8 8 0 1 1-15-2c2 2 3 1 3-1 0-3 1-5 1-8z" />
+          </svg>
+        </span>
+        Trending now
+      </h2>
+      <div class="chips" id="trending-chips"></div>
+    </section>
+
+    <footer>
+      <span class="grp"><kbd>↑</kbd><kbd>↓</kbd> navigate</span>
+      <span class="grp"><kbd>Enter</kbd> search</span>
+      <span class="grp"><kbd>Esc</kbd> dismiss</span>
+    </footer>
+  </div>
+
+  <script>
+    const API = "";                 // same origin as the page
+    const DEBOUNCE_MS = 150;        // avoid a backend call on every keystroke
+    const input    = document.getElementById("search-input");
+    const dropdown = document.getElementById("dropdown");
+    const spinner  = document.getElementById("spinner");
+    const banner   = document.getElementById("banner");
+    const searchBtn= document.getElementById("search-btn");
+    const trendingChips = document.getElementById("trending-chips");
+
+    let debounceTimer = null;
+    let activeIndex = -1;           // keyboard-highlighted suggestion
+    let currentItems = [];          // last rendered suggestions
+    let lastRequestId = 0;          // guards against out-of-order responses
+
+    // ---------- Suggestions (debounced) ----------
+    input.addEventListener("input", () => {
+      clearTimeout(debounceTimer);
+      const q = input.value;
+      if (!q.trim()) { hideDropdown(); return; }
+      debounceTimer = setTimeout(() => fetchSuggestions(q), DEBOUNCE_MS);
+    });
+
+    async function fetchSuggestions(q) {
+      const reqId = ++lastRequestId;
+      spinner.classList.add("show");
+      try {
+        const res = await fetch(`${API}/suggest?q=${encodeURIComponent(q)}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (reqId !== lastRequestId) return;   // a newer keystroke already fired
+        renderSuggestions(data.suggestions || [], q, data.source);
+      } catch (err) {
+        if (reqId !== lastRequestId) return;
+        showError("Couldn’t load suggestions — is the server running?");
+        hideDropdown();
+      } finally {
+        if (reqId === lastRequestId) spinner.classList.remove("show");
+      }
+    }
+
+    function renderSuggestions(items, q, source) {
+      currentItems = items;
+      activeIndex = -1;
+      if (items.length === 0) {
+        dropdown.innerHTML =
+          `<div class="empty-hint">No matches for <b>“${escapeHtml(q)}”</b>. Press <b>Enter</b> to search it anyway.</div>`;
+        showDropdown();
+        return;
+      }
+      const ql = q.trim().toLowerCase();
+      const maxScore = Math.max(...items.map(it => it.score || 0), 1);
+      const srcLabel = source === "cache"
+        ? `served from <b>cache</b>`
+        : `served from <b>${escapeHtml(source || "index")}</b>`;
+      const head =
+        `<div class="dd-head"><span>${items.length} suggestion${items.length === 1 ? "" : "s"}</span>` +
+        `<span class="src">${srcLabel}</span></div>`;
+      const rows = items.map((it, i) => {
+        const text = it.query;
+        const matchLen = text.toLowerCase().startsWith(ql) ? ql.length : 0;
+        const label = matchLen
+          ? `<b>${escapeHtml(text.slice(0, matchLen))}</b>${escapeHtml(text.slice(matchLen))}`
+          : escapeHtml(text);
+        const pct = Math.max(6, Math.round(((it.score || 0) / maxScore) * 100));
+        return `
+          <div class="suggestion" role="option" data-index="${i}">
+            <span class="ic">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
+                <circle cx="11" cy="11" r="7" /><line x1="21" y1="21" x2="16.65" y2="16.65" />
+              </svg>
+            </span>
+            <span class="label">${label}</span>
+            <span class="meta">
+              <span class="bar" title="popularity"><i style="width:${pct}%"></i></span>
+              <span class="score">${formatScore(it.score)}</span>
+            </span>
+          </div>`;
+      }).join("");
+      dropdown.innerHTML = head + rows;
+      dropdown.querySelectorAll(".suggestion").forEach(el => {
+        el.addEventListener("click", () => selectItem(parseInt(el.dataset.index)));
+        el.addEventListener("mousemove", () => { activeIndex = parseInt(el.dataset.index); highlight(); });
+      });
+      showDropdown();
+    }
+
+    function selectItem(i) {
+      if (i < 0 || i >= currentItems.length) return;
+      input.value = currentItems[i].query;
+      hideDropdown();
+      submitSearch();
+    }
+
+    // ---------- Keyboard navigation ----------
+    input.addEventListener("keydown", (e) => {
+      const open = dropdown.classList.contains("show") && currentItems.length > 0;
+      if (e.key === "ArrowDown" && open) {
+        e.preventDefault(); activeIndex = (activeIndex + 1) % currentItems.length; highlight();
+      } else if (e.key === "ArrowUp" && open) {
+        e.preventDefault(); activeIndex = (activeIndex - 1 + currentItems.length) % currentItems.length; highlight();
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        if (open && activeIndex >= 0) selectItem(activeIndex);
+        else submitSearch();
+      } else if (e.key === "Escape") {
+        hideDropdown();
+      }
+    });
+
+    function highlight() {
+      dropdown.querySelectorAll(".suggestion").forEach((el, i) => {
+        el.classList.toggle("active", i === activeIndex);
+        if (i === activeIndex) el.scrollIntoView({ block: "nearest" });
+      });
+    }
+
+    // ---------- Search submission (POST /search; M3 wires the backend) ----------
+    searchBtn.addEventListener("click", submitSearch);
+
+    async function submitSearch() {
+      const q = input.value.trim();
+      if (!q) { showError("Type something to search."); return; }
+      hideDropdown();
+      spinner.classList.add("show");
+      try {
+        const res = await fetch(`${API}/search`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query: q }),
+        });
+        if (res.status === 404 || res.status === 405) {
+          showOk(q, "Searched");          // /search lands in M3 — degrade gracefully
+          return;
+        }
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        showOk(q, data.message || "Searched");
+        loadTrending();                   // refresh trending after a search
+      } catch (err) {
+        showError("Search failed — is the server running?");
+      } finally {
+        spinner.classList.remove("show");
+      }
+    }
+
+    // ---------- Trending (GET /trending; M5 implements it) ----------
+    async function loadTrending() {
+      try {
+        const res = await fetch(`${API}/trending`);
+        if (!res.ok) throw new Error("not ready");
+        const data = await res.json();
+        const items = data.trending || data.suggestions || [];
+        if (!items.length) { trendingChips.innerHTML = `<span class="muted">Nothing trending yet — run a few searches.</span>`; return; }
+        trendingChips.innerHTML = items.slice(0, 10).map((it, i) => `
+          <button class="chip" data-q="${escapeHtml(it.query)}" type="button">
+            <span class="rank">${String(i + 1).padStart(2, "0")}</span>
+            <span>${escapeHtml(it.query)}</span>
+            ${it.score != null ? `<span class="tscore">${formatScore(it.score)}</span>` : ""}
+          </button>`).join("");
+        trendingChips.querySelectorAll(".chip").forEach(el => {
+          el.addEventListener("click", () => { input.value = el.dataset.q; submitSearch(); });
+        });
+      } catch (err) {
+        trendingChips.innerHTML = `<span class="muted">Trending searches will appear here once you start searching.</span>`;
+      }
+    }
+
+    // ---------- Helpers ----------
+    function showDropdown() { dropdown.classList.add("show"); input.setAttribute("aria-expanded", "true"); }
+    function hideDropdown() { dropdown.classList.remove("show"); input.setAttribute("aria-expanded", "false"); activeIndex = -1; }
+    function showOk(q, msg) {
+      banner.className = "banner ok show";
+      banner.innerHTML = `<span class="mark">✓</span><span><b>${escapeHtml(msg)}</b> — <code>${escapeHtml(q)}</code></span>`;
+    }
+    function showError(msg) {
+      banner.className = "banner err show";
+      banner.innerHTML = `<span class="mark">!</span><span>${escapeHtml(msg)}</span>`;
+    }
+    function formatScore(n) {
+      if (n == null) return "";
+      if (n >= 1000) return (n / 1000).toFixed(n >= 10000 ? 0 : 1) + "k";
+      return String(n);
+    }
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, c => (
+        { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+      ));
+    }
+
+    // Close dropdown when clicking outside.
+    document.addEventListener("click", (e) => {
+      if (!e.target.closest(".search-wrap")) hideDropdown();
+    });
+
+    // Re-open dropdown on focus if there's a query.
+    input.addEventListener("focus", () => {
+      if (input.value.trim() && currentItems.length) showDropdown();
+    });
+
+    // Initial load.
+    loadTrending();
+    input.focus();
+  </script>
+</body>
+</html>
