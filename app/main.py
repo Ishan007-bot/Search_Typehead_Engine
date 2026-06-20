@@ -13,13 +13,15 @@ GET /cache/debug, trending searches, and batch writes.
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Query
+from fastapi import Body, FastAPI, Query
 from fastapi.responses import FileResponse, JSONResponse
 
 from app.datastore import DataStore
 from app.trie import Trie
 
 MAX_SUGGESTIONS = 10
+INITIAL_COUNT = 1          # count assigned to a brand-new query on first search
+MAX_QUERY_LEN = 200        # reject absurdly long inputs
 UI_DIR = Path(__file__).resolve().parent.parent / "ui"
 
 # Module-level singletons, wired up in the lifespan handler.
@@ -78,6 +80,51 @@ def suggest(q: str = Query(default="", description="The prefix the user has type
         "suggestions": [{"query": text, "score": cnt} for text, cnt in results],
         "source": "trie",  # will become "cache"/"trie" once M4 lands
     }
+
+
+def record_search(query: str) -> int:
+    """Record one search for `query` and return its new count.
+
+    This is the single choke-point for count updates. In M3 it writes through
+    synchronously:
+      - SQLite (source of truth): +1 (insert with INITIAL_COUNT if new)
+      - Trie (read model): bump so /suggest reflects it immediately
+    In M6 the SQLite write is replaced by an enqueue into the batch buffer; the
+    endpoint and trie update stay exactly the same. Keeping this seam here is why
+    M6 won't require touching the endpoint.
+    """
+    # Trie bump returns the authoritative new count (existing + 1, or INITIAL_COUNT).
+    new_count = trie.bump(query, delta=INITIAL_COUNT)
+    # Persist the same increment to SQLite (one query -> +INITIAL_COUNT).
+    store.apply_increments({query.strip().lower(): INITIAL_COUNT})
+    return new_count
+
+
+@app.post("/search")
+def search(payload: dict = Body(...)):
+    """Submit a search.
+
+    Request body: {"query": "<text>"}
+    Response:     {"message": "Searched", "query": "<text>", "count": <new count>}
+
+    Behavior (assignment section 4.2):
+    - Returns the dummy response {"message": "Searched"}.
+    - Updates the query-count store: existing query -> count increases;
+      new query -> inserted with an initial count.
+    - The update is reflected in /suggest right away (trie is bumped in-process).
+    """
+    raw = payload.get("query") if isinstance(payload, dict) else None
+    query = (raw or "").strip()
+    if not query:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "empty_query", "message": "Provide a non-empty 'query'."},
+        )
+    if len(query) > MAX_QUERY_LEN:
+        query = query[:MAX_QUERY_LEN]
+
+    new_count = record_search(query)
+    return {"message": "Searched", "query": query.lower(), "count": new_count}
 
 
 @app.exception_handler(Exception)

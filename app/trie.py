@@ -90,6 +90,21 @@ class Trie:
         if len(node.top) > self.top_k:
             node.top = node.top[: self.top_k]
 
+    def bump(self, query: str, delta: int = 1) -> int:
+        """Increment a query's count by `delta` (insert it if new). Returns the
+        new absolute count. Refreshes cached top-K along the path so suggestions
+        reflect the update immediately. Used by the search-record path (M3) and
+        by the batch writer's in-memory sync (M6)."""
+        query = (query or "").strip().lower()
+        if not query:
+            return 0
+        with self._lock:
+            node = self._find_node(query)
+            current = node.count if (node is not None and node.is_word) else 0
+            new_count = current + delta
+            self._insert_locked(query, new_count)
+            return new_count
+
     def build_from_rows(self, rows) -> None:
         """Bulk-build from an iterable of objects/tuples with query & count.
 
