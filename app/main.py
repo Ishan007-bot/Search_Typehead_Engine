@@ -11,14 +11,16 @@ GET /cache/debug, trending searches, and batch writes.
 """
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from app.datastore import DataStore
 from app.trie import Trie
 
 MAX_SUGGESTIONS = 10
+UI_DIR = Path(__file__).resolve().parent.parent / "ui"
 
 # Module-level singletons, wired up in the lifespan handler.
 store: DataStore | None = None
@@ -42,6 +44,12 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Search Typeahead System", version="0.1.0", lifespan=lifespan)
+
+
+@app.get("/")
+def index():
+    """Serve the single-page UI (same origin as the API, so no CORS needed)."""
+    return FileResponse(UI_DIR / "index.html")
 
 
 @app.get("/health")
