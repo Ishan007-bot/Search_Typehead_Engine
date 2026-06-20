@@ -144,3 +144,26 @@ class Trie:
         if node is None:
             return []
         return node.top[:limit]
+
+    def candidates(self, prefix: str, limit: int = 50) -> List[Tuple[str, int]]:
+        """Return up to `limit` (query, count) candidates under `prefix`, by count
+        desc. Wider than suggest()'s cached top-K — used by the recency-aware
+        re-ranker so a recently-hot query can climb into the top 10 even if its
+        raw count alone wouldn't put it there. Walks the subtree (DFS); only
+        called on an enhanced-mode cache miss, so it's off the hot path."""
+        prefix = (prefix or "").strip().lower()
+        if not prefix:
+            return []
+        node = self._find_node(prefix)
+        if node is None:
+            return []
+        out: List[Tuple[str, int]] = []
+        stack = [(node, prefix)]
+        while stack:
+            n, word = stack.pop()
+            if n.is_word:
+                out.append((word, n.count))
+            for ch, child in n.children.items():
+                stack.append((child, word + ch))
+        out.sort(key=lambda qc: qc[1], reverse=True)
+        return out[:limit]

@@ -20,21 +20,41 @@ from pathlib import Path
 from fastapi import Body, FastAPI, Query
 from fastapi.responses import FileResponse, JSONResponse
 
+from app.batch_writer import BatchWriter
 from app.cache_cluster import CacheCluster
 from app.datastore import DataStore
+from app.trending import TrendingTracker
 from app.trie import Trie
 
 MAX_SUGGESTIONS = 10
 INITIAL_COUNT = 1          # count assigned to a brand-new query on first search
 MAX_QUERY_LEN = 200        # reject absurdly long inputs
-CACHE_TTL_SECONDS = 30.0   # how long a cached suggestion list stays fresh
+CACHE_TTL_BASIC = 30.0     # basic (count) ranking changes slowly -> long TTL
+CACHE_TTL_ENHANCED = 5.0   # recency ranking drifts every bucket tick -> short TTL
 CACHE_SWEEP_SECONDS = 15.0 # how often the background task trims expired entries
+CANDIDATE_POOL = 50        # how many count-ranked candidates the re-ranker considers
+# Trending knobs (kept small here so the demo shows decay within a short run).
+BUCKET_SECONDS = 30.0
+WINDOW_BUCKETS = 6
+DECAY = 0.7
+BOOST = 3.0
+# Batch-write knobs: flush when 50 distinct queries buffered OR every 2s.
+BATCH_SIZE = 50
+FLUSH_INTERVAL = 2.0
 UI_DIR = Path(__file__).resolve().parent.parent / "ui"
 
 # Module-level singletons, wired up in the lifespan handler.
 store: DataStore | None = None
 trie: Trie | None = None
 cache: CacheCluster | None = None
+trending: TrendingTracker | None = None
+batch: BatchWriter | None = None
+
+
+def _ck(prefix: str, mode: str) -> str:
+    """Cache key namespaced by ranking mode, so basic and enhanced results never
+    collide (the same prefix has a different answer in each mode)."""
+    return f"{mode}:{prefix.strip().lower()}"
 
 
 async def _cache_sweeper():
@@ -50,11 +70,23 @@ async def _cache_sweeper():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Build the trie from SQLite and start the cache cluster, at startup."""
-    global store, trie, cache
+    global store, trie, cache, trending, batch
     store = DataStore()
     trie = Trie(top_k=MAX_SUGGESTIONS)
     trie.build_from_rows(store.all_rows())
-    cache = CacheCluster(ttl_seconds=CACHE_TTL_SECONDS)
+    cache = CacheCluster(ttl_seconds=CACHE_TTL_BASIC)
+    trending = TrendingTracker(
+        bucket_seconds=BUCKET_SECONDS, window_buckets=WINDOW_BUCKETS,
+        decay=DECAY, boost=BOOST,
+    )
+    # The batch writer's flush function is the ONLY thing that writes search
+    # increments to SQLite now. apply_increments() persists the whole aggregated
+    # batch in one transaction and returns rows written.
+    batch = BatchWriter(
+        flush_fn=store.apply_increments,
+        batch_size=BATCH_SIZE, flush_interval=FLUSH_INTERVAL,
+    )
+    batch.start()
     print(f"[startup] Loaded {len(trie)} queries into the trie from SQLite.")
     print(f"[startup] Cache cluster up with nodes: {cache.ring.nodes}")
     if len(trie) == 0:
@@ -62,6 +94,10 @@ async def lifespan(app: FastAPI):
     sweeper = asyncio.create_task(_cache_sweeper())
     yield
     sweeper.cancel()
+    # Graceful shutdown: stop the timer and flush the last partial batch BEFORE
+    # closing the DB, so buffered searches aren't lost on a clean stop.
+    if batch is not None:
+        batch.stop()
     if store is not None:
         store.close()
 
@@ -84,73 +120,117 @@ def health():
     }
 
 
+def _rank_basic(prefix: str) -> list[dict]:
+    """BASIC ranking (60% version): top-K by all-time count, straight from the
+    trie's per-node cached top-K."""
+    results = trie.suggest(prefix, limit=MAX_SUGGESTIONS) if trie else []
+    return [{"query": text, "score": cnt} for text, cnt in results]
+
+
+def _rank_enhanced(prefix: str) -> list[dict]:
+    """ENHANCED ranking (20% version): recency-aware re-rank.
+
+    Take a WIDE pool of count-ranked candidates (so a recently-hot query can
+    enter the top 10 even if its raw count wouldn't), then sort by the blended
+    score = log10(1+count) + BOOST * decayed_recent_score. We expose both the
+    blended score and the raw count so the difference vs basic is visible.
+    """
+    if not trie:
+        return []
+    pool = trie.candidates(prefix, limit=CANDIDATE_POOL)
+    rescored = []
+    for query, count in pool:
+        blended = trending.blended_score(query, count) if trending else 0.0
+        recent = trending.recent_score(query) if trending else 0.0
+        rescored.append((query, count, blended, recent))
+    rescored.sort(key=lambda x: x[2], reverse=True)
+    return [
+        {"query": q, "score": round(b, 4), "count": c, "recent": round(r, 4)}
+        for (q, c, b, r) in rescored[:MAX_SUGGESTIONS]
+    ]
+
+
 @app.get("/suggest")
-def suggest(q: str = Query(default="", description="The prefix the user has typed")):
-    """Return up to 10 suggestions whose query starts with the prefix `q`,
-    sorted by all-time count (descending).
+def suggest(
+    q: str = Query(default="", description="The prefix the user has typed"),
+    mode: str = Query(default="basic", description="Ranking mode: 'basic' (count) or 'enhanced' (recency-aware)"),
+):
+    """Return up to 10 prefix-matching suggestions.
 
-    Read path (M4):
-        1. Route the prefix to its owning cache node (consistent hashing).
-        2. CACHE HIT  -> return the cached list (source="cache"). No ranking work.
-        3. CACHE MISS -> ask the trie, cache the result with a TTL, return it
-                         (source="trie").
+    Two ranking modes via the SAME endpoint (assignment section 7):
+      - mode=basic    -> sorted by all-time count (the 60% version)
+      - mode=enhanced -> recency-aware blended score (the 20% version)
 
-    Graceful handling:
-    - empty / missing / whitespace `q` -> empty list, not cached (200).
-    - mixed-case `q` -> matched case-insensitively (cache key is normalized).
-    - prefix with no matches -> empty list (200).
+    Read path (M4 + M5):
+        1. Route the (mode-namespaced) prefix to its owning cache node.
+        2. CACHE HIT  -> return cached list (source="cache").
+        3. CACHE MISS -> rank via the chosen mode, cache with a mode-specific TTL
+                         (basic = long, enhanced = short since recency drifts),
+                         return it (source="trie").
+
+    Graceful handling: empty/whitespace/missing q -> empty list (not cached);
+    mixed-case matched case-insensitively; no-match -> empty list.
     """
     prefix = (q or "").strip()
+    mode = mode if mode in ("basic", "enhanced") else "basic"
     if not prefix:
-        return {"query": prefix, "count": 0, "suggestions": [], "source": "none"}
+        return {"query": prefix, "mode": mode, "count": 0, "suggestions": [], "source": "none"}
 
-    # 1+2. Try the cache first.
-    cached = cache.get(prefix) if cache else None
+    key = _ck(prefix, mode)
+    cached = cache.get(key) if cache else None
     if cached is not None:
         return {
-            "query": prefix,
-            "count": len(cached),
-            "suggestions": cached,
-            "source": "cache",
-            "owner_node": cache.owner(prefix),
+            "query": prefix, "mode": mode, "count": len(cached),
+            "suggestions": cached, "source": "cache", "owner_node": cache.owner(key),
         }
 
-    # 3. Miss -> compute from the trie, then populate the cache.
-    results = trie.suggest(prefix, limit=MAX_SUGGESTIONS) if trie else []
-    payload = [{"query": text, "score": cnt} for text, cnt in results]
+    payload = _rank_enhanced(prefix) if mode == "enhanced" else _rank_basic(prefix)
     if cache is not None:
-        cache.set(prefix, payload)
+        ttl = CACHE_TTL_ENHANCED if mode == "enhanced" else CACHE_TTL_BASIC
+        cache.set(key, payload, ttl=ttl)
     return {
-        "query": prefix,
-        "count": len(payload),
-        "suggestions": payload,
-        "source": "trie",
-        "owner_node": cache.owner(prefix) if cache else None,
+        "query": prefix, "mode": mode, "count": len(payload),
+        "suggestions": payload, "source": "trie",
+        "owner_node": cache.owner(key) if cache else None,
     }
 
 
 def record_search(query: str) -> int:
     """Record one search for `query` and return its new count.
 
-    This is the single choke-point for count updates. In M3 it writes through
-    synchronously:
-      - SQLite (source of truth): +1 (insert with INITIAL_COUNT if new)
-      - Trie (read model): bump so /suggest reflects it immediately
-    In M6 the SQLite write is replaced by an enqueue into the batch buffer; the
-    endpoint and trie update stay exactly the same. Keeping this seam here is why
-    M6 won't require touching the endpoint.
+    This is the single choke-point for count updates. As of M6:
+      - Trie (read model): bumped synchronously, so /suggest reflects the search
+        immediately (reads stay fresh without waiting for a DB flush).
+      - SQLite (source of truth): NOT written here. The increment is ENQUEUED
+        into the batch writer, which aggregates duplicates and flushes the whole
+        batch in one transaction (size- or timer-triggered). This is the M6 swap
+        that the M3 seam was designed for — the endpoint above is unchanged.
+      - Recency tracker: updated for trending / enhanced ranking.
+
+    Why bump the trie now but defer the DB write? The trie is our fast read
+    model; keeping it current means suggestions reflect a search instantly. The
+    DB is the durable record; batching its writes is where the write-reduction
+    win comes from. They reconcile because both apply the SAME +INITIAL_COUNT.
     """
+    norm = query.strip().lower()
     # Trie bump returns the authoritative new count (existing + 1, or INITIAL_COUNT).
     new_count = trie.bump(query, delta=INITIAL_COUNT)
-    # Persist the same increment to SQLite (one query -> +INITIAL_COUNT).
-    store.apply_increments({query.strip().lower(): INITIAL_COUNT})
+    # Enqueue the SQLite increment instead of writing it now (batched).
+    if batch is not None:
+        batch.enqueue(norm, INITIAL_COUNT)
+    # Record recency for trending / enhanced ranking (M5): this search lands in
+    # the current time bucket for this query.
+    if trending is not None:
+        trending.record(norm, INITIAL_COUNT)
     # Invalidate cached suggestion lists that could now be stale. Bumping
-    # "iphone" can change the ranking for every prefix of it: "i","ip",...,"iphone".
-    # We invalidate exactly those prefixes so the next /suggest recomputes a fresh
-    # list. (TTL is the backstop if a prefix is somehow missed.)
+    # "iphone" can re-rank every prefix of it ("i","ip",...,"iphone") in BOTH
+    # ranking modes, so we invalidate both namespaces. (TTL is the backstop.)
     if cache is not None:
-        norm = query.strip().lower()
-        prefixes = [norm[:i] for i in range(1, len(norm) + 1)]
+        prefixes = []
+        for i in range(1, len(norm) + 1):
+            p = norm[:i]
+            prefixes.append(_ck(p, "basic"))
+            prefixes.append(_ck(p, "enhanced"))
         cache.invalidate_prefixes(prefixes)
     return new_count
 
@@ -180,6 +260,49 @@ def search(payload: dict = Body(...)):
 
     new_count = record_search(query)
     return {"message": "Searched", "query": query.lower(), "count": new_count}
+
+
+@app.get("/trending")
+def get_trending(limit: int = Query(default=10, ge=1, le=50)):
+    """Top queries by recent (time-decayed) activity — what's hot right now.
+
+    Independent of all-time popularity: ranks purely on the recency signal, so a
+    query that just spiked appears even if its all-time count is small. As its
+    activity ages out of the sliding window, it drops off automatically.
+    """
+    if trending is None:
+        return {"trending": []}
+    items = trending.trending(limit=limit)
+    return {
+        "trending": [{"query": q, "score": round(s, 4)} for q, s in items],
+        "window_seconds": BUCKET_SECONDS * WINDOW_BUCKETS,
+    }
+
+
+@app.get("/trending/stats")
+def trending_stats():
+    if trending is None:
+        return {"error": "not_ready"}
+    return trending.stats()
+
+
+@app.get("/batch/stats")
+def batch_stats():
+    """Write-reduction evidence (assignment section 8): how many searches were
+    enqueued vs how many actual DB transactions (flushes) happened."""
+    if batch is None:
+        return JSONResponse(status_code=503, content={"error": "batch_not_ready"})
+    return batch.stats()
+
+
+@app.post("/batch/flush")
+def batch_flush():
+    """Force-flush the buffer now (handy for the demo so you can see counts hit
+    SQLite without waiting for the timer)."""
+    if batch is None:
+        return JSONResponse(status_code=503, content={"error": "batch_not_ready"})
+    rows = batch.flush_now()
+    return {"flushed_rows": rows, "stats": batch.stats()}
 
 
 @app.get("/cache/debug")
