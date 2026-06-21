@@ -21,22 +21,23 @@ import random
 import statistics
 import time
 import urllib.request as u
+from urllib.parse import quote
 
-# A realistic-ish set of prefixes a user might type, skewed so some are hot.
+# A realistic set of prefixes a user might type. These match the ORCAS dataset
+# (real Bing search queries), so the benchmark exercises real cache keys.
 PREFIXES = [
-    "i", "ip", "iph", "ipho", "iphone",
-    "sam", "sams", "samsung",
-    "lap", "lapt", "laptop",
-    "head", "headp",
-    "watch", "wat",
-    "cam", "camera",
-    "mou", "mouse",
-    "key", "keyboard",
-    "char", "charger",
-    "tab", "tablet",
-    "spe", "speaker",
-    "sho", "shoes",
-    "mon", "monitor",
+    "w", "we", "wea", "weath", "weather",
+    "you", "yout", "youtube",
+    "face", "faceb", "facebook",
+    "goog", "googl", "google",
+    "amaz", "amazon",
+    "map", "maps", "mapq",
+    "how", "how to",
+    "wal", "walm", "walmart",
+    "net", "netf", "netflix",
+    "ebay", "eba",
+    "gma", "gmail",
+    "craig", "craigslist",
 ]
 
 
@@ -64,7 +65,7 @@ def _pct(values, p):
 
 def time_suggest(base, prefix, mode="basic"):
     t0 = time.perf_counter()
-    resp = _get(base, f"/suggest?q={prefix}&mode={mode}")
+    resp = _get(base, f"/suggest?q={quote(prefix)}&mode={mode}")
     dt = (time.perf_counter() - t0) * 1000.0   # ms
     return dt, resp.get("source")
 
@@ -117,8 +118,8 @@ def bench_cache_hitrate(base):
 
 def bench_write_reduction(base, n_searches=3000):
     print(f"\n=== WRITE REDUCTION ({n_searches} POST /search) ===")
-    words = ["iphone", "ipad", "laptop", "watch", "mouse", "keyboard",
-             "monitor", "camera", "tablet", "speaker", "charger", "shoes"]
+    words = ["weather", "youtube", "facebook", "google", "amazon", "maps",
+             "walmart", "netflix", "ebay", "gmail", "craigslist", "google maps"]
     before = _get(base, "/batch/stats")
     t0 = time.perf_counter()
     for _ in range(n_searches):
@@ -144,8 +145,8 @@ def show_consistent_hashing(base):
     print("\n=== CONSISTENT HASHING (prefix -> owning node) ===")
     dbg = _get(base, "/cache/debug?prefix=iph")
     print(f"  sample distribution across nodes: {dbg['sample_distribution']}")
-    for p in ["iph", "sam", "lap", "head", "watch", "camera", "mouse"]:
-        d = _get(base, f"/cache/debug?prefix={p}")
+    for p in ["weath", "you", "face", "goog", "amaz", "maps", "netf"]:
+        d = _get(base, f"/cache/debug?prefix={quote(p)}")
         print(f"    {p:8} -> {d['owner_node']:14} (ring_pos={d['ring_position']})")
 
 

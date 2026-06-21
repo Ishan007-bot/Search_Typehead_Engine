@@ -306,20 +306,34 @@ def batch_flush():
 
 
 @app.get("/cache/debug")
-def cache_debug(prefix: str = Query(default="", description="Prefix to inspect")):
+def cache_debug(
+    prefix: str = Query(default="", description="Prefix to inspect"),
+    mode: str = Query(default="basic", description="Ranking mode the prefix is cached under"),
+):
     """Show which cache node owns `prefix` and whether it is currently a hit/miss.
 
     Demonstrates consistent-hashing routing (assignment section 5). Includes the
     ring position so you can see *why* a prefix lands on a given node, and the
     distribution of a sample of prefixes across nodes to show even spread.
+
+    IMPORTANT: /suggest caches under a mode-namespaced key (e.g. "basic:iph") so
+    that basic and recency-aware results don't collide. We inspect that SAME key
+    here, otherwise the reported owner/hit-status wouldn't match what /suggest
+    actually stores.
     """
     if cache is None:
         return JSONResponse(status_code=503, content={"error": "cache_not_ready"})
-    info = cache.debug(prefix)
-    # Bonus: show how a sample of prefixes spreads across nodes (even distribution).
+    mode = mode if mode in ("basic", "enhanced") else "basic"
+    key = _ck(prefix, mode)
+    info = cache.debug(key)
+    # Re-label so the response talks about the user's prefix, not the internal key.
+    info["prefix"] = prefix
+    info["mode"] = mode
+    info["cache_key"] = key
+    # Bonus: how a sample of prefixes (in this mode) spreads across nodes.
     sample = ["a", "b", "c", "i", "ip", "iph", "sam", "lap", "head", "watch",
               "camera", "mouse", "tablet", "speaker", "shoes", "charger"]
-    info["sample_distribution"] = cache.ring.distribution(sample)
+    info["sample_distribution"] = cache.ring.distribution([_ck(p, mode) for p in sample])
     return info
 
 

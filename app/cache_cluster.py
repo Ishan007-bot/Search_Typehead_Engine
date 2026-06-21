@@ -1,31 +1,57 @@
 """
-Distributed cache cluster = N CacheNodes + a ConsistentHashRing in front.
+Distributed cache cluster = N real Redis nodes + a ConsistentHashRing in front.
 
-This is the "distributed cache" the assignment asks for. The nodes are separate
-logical CacheNode objects (each its own store + stats), exactly as N Redis
-instances would be — but in-process, so the project runs with one command and
-every routing decision is visible, inspectable code (ideal for the viva).
+This is the "distributed cache" the assignment asks for. The ring (which we wrote,
+see ring.py) decides which node owns a prefix; the nodes are genuinely separate
+Redis processes (one per logical node, on their own ports), so the distribution is
+across real, independent processes — the strongest reading of "distributed cache".
+
+Run it with `docker compose up` (three Redis containers on 6379/6380/6381 plus the
+app). To point at Redis without Docker, set REDIS_NODES to host:port pairs.
+
+What the ring owns vs what Redis owns (viva point):
+  - OUR consistent-hash ring decides which node a prefix maps to, using virtual
+    nodes for even spread and minimal remapping on membership change.
+  - REDIS stores that node's cached suggestion lists and enforces TTL natively.
+  The routing/distribution logic is ours and fully explainable; Redis is just the
+  storage behind each node.
 
 Routing: for any prefix key, the ring picks the owning node. The same key always
 maps to the same node (until membership changes), so reads and writes for a key
 go to one place — that's what makes a hit possible.
 """
 
+import os
 from typing import Any, List, Optional
 
-from app.cache import CacheNode
+from app.redis_cache import RedisCacheNode
 from app.ring import ConsistentHashRing
 
 DEFAULT_NODES = ["cache-node-0", "cache-node-1", "cache-node-2"]
+
+# Each logical node maps to a real Redis instance. Endpoints come from REDIS_NODES
+# as comma-separated host:port pairs, one per logical node — works for Docker
+# (separate service hosts) and local (several ports on localhost).
+REDIS_NODES = os.getenv(
+    "REDIS_NODES", "127.0.0.1:6379,127.0.0.1:6380,127.0.0.1:6381"
+).split(",")
+
+
+def _parse_endpoint(ep: str) -> tuple[str, int]:
+    host, _, port = ep.strip().rpartition(":")
+    return (host or "127.0.0.1"), int(port)
 
 
 class CacheCluster:
     def __init__(self, node_names: Optional[List[str]] = None, ttl_seconds: float = 30.0):
         names = node_names or DEFAULT_NODES
         self.ring = ConsistentHashRing(names)
-        self.nodes: dict[str, CacheNode] = {
-            n: CacheNode(n, ttl_seconds=ttl_seconds) for n in names
-        }
+        self.backend = "redis"
+        self.nodes = {}
+        for i, name in enumerate(names):
+            host, port = _parse_endpoint(REDIS_NODES[i % len(REDIS_NODES)])
+            self.nodes[name] = RedisCacheNode(name, host=host, port=port,
+                                              ttl_seconds=ttl_seconds)
         self.ttl = ttl_seconds
 
     # ----- key normalization --------------------------------------------------
@@ -71,6 +97,7 @@ class CacheCluster:
     # ----- maintenance & introspection ---------------------------------------
 
     def sweep_expired(self) -> int:
+        # Redis enforces TTL itself, so this is a no-op; kept for interface parity.
         return sum(node.sweep_expired() for node in self.nodes.values())
 
     def clear(self) -> int:
@@ -82,6 +109,7 @@ class CacheCluster:
         misses = sum(s["misses"] for s in per_node)
         total = hits + misses
         return {
+            "backend": self.backend,
             "nodes": per_node,
             "total_hits": hits,
             "total_misses": misses,
@@ -91,18 +119,14 @@ class CacheCluster:
 
     def debug(self, prefix: str) -> dict:
         """Everything /cache/debug needs: which node owns the prefix, the ring
-        position, and whether the key is currently cached (a hit if requested now)."""
+        position, and whether the key is currently cached. Uses node.peek() so it
+        never mutates hit/miss counters."""
         key = self._key(prefix)
         node_name = self.ring.get_node(key)
         node = self.nodes.get(node_name) if node_name else None
-        # Peek WITHOUT touching hit/miss counters.
-        cached = False
-        if node is not None:
-            with node._lock:
-                import time
-                entry = node._store.get(key)
-                cached = entry is not None and time.time() < entry[0]
+        cached = node.peek(key) if node is not None else False
         return {
+            "backend": self.backend,
             "prefix": prefix,
             "normalized_key": key,
             "ring_position": self.ring.position_of(key),
