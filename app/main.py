@@ -23,6 +23,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from app.batch_writer import BatchWriter
 from app.cache_cluster import CacheCluster
 from app.datastore import DataStore
+from app.events import event_log
 from app.trending import TrendingTracker
 from app.trie import Trie
 
@@ -32,6 +33,7 @@ MAX_QUERY_LEN = 200        # reject absurdly long inputs
 CACHE_TTL_BASIC = 30.0     # basic (count) ranking changes slowly -> long TTL
 CACHE_TTL_ENHANCED = 5.0   # recency ranking drifts every bucket tick -> short TTL
 CACHE_SWEEP_SECONDS = 15.0 # how often the background task trims expired entries
+DECAY_SNAPSHOT_SECONDS = 10.0  # how often the activity log snapshots recency scores
 CANDIDATE_POOL = 50        # how many count-ranked candidates the re-ranker considers
 # Trending knobs (kept small here so the demo shows decay within a short run).
 BUCKET_SECONDS = 30.0
@@ -67,6 +69,21 @@ async def _cache_sweeper():
             cache.sweep_expired()
 
 
+async def _decay_snapshotter():
+    """Background task: every DECAY_SNAPSHOT_SECONDS, if anything is trending, emit
+    a snapshot of the current (time-decayed) recency scores. Watching the same
+    query's score fall across snapshots makes recency decay visible in the UI."""
+    while True:
+        await asyncio.sleep(DECAY_SNAPSHOT_SECONDS)
+        if trending is None:
+            continue
+        top = trending.trending(limit=3)
+        if top:
+            summary = ", ".join(f"{q}={s:.2f}" for q, s in top)
+            event_log.emit("recency", f"DECAY snapshot — top recent scores: {summary}",
+                           top=[{"query": q, "score": round(s, 3)} for q, s in top])
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Build the trie from SQLite and start the cache cluster, at startup."""
@@ -81,9 +98,21 @@ async def lifespan(app: FastAPI):
     )
     # The batch writer's flush function is the ONLY thing that writes search
     # increments to SQLite now. apply_increments() persists the whole aggregated
-    # batch in one transaction and returns rows written.
+    # batch in one transaction and returns rows written. We wrap it to emit an
+    # activity event each flush, so the UI can show batch flushes happening.
+    def _flush_and_log(increments: dict[str, int]) -> int:
+        n_searches = sum(increments.values())
+        rows = store.apply_increments(increments)
+        if rows:
+            event_log.emit(
+                "batch",
+                f"FLUSH {n_searches} searches → {rows} row(s) in 1 transaction",
+                searches=n_searches, rows=rows,
+            )
+        return rows
+
     batch = BatchWriter(
-        flush_fn=store.apply_increments,
+        flush_fn=_flush_and_log,
         batch_size=BATCH_SIZE, flush_interval=FLUSH_INTERVAL,
     )
     batch.start()
@@ -92,8 +121,11 @@ async def lifespan(app: FastAPI):
     if len(trie) == 0:
         print("[startup] WARNING: trie is empty. Run: python data/load_data.py")
     sweeper = asyncio.create_task(_cache_sweeper())
+    snapshotter = asyncio.create_task(_decay_snapshotter())
+    event_log.emit("search", f"Server ready — {len(trie)} queries, cache backend: {cache.backend}")
     yield
     sweeper.cancel()
+    snapshotter.cancel()
     # Graceful shutdown: stop the timer and flush the last partial batch BEFORE
     # closing the DB, so buffered searches aren't lost on a clean stop.
     if batch is not None:
@@ -177,13 +209,16 @@ def suggest(
         return {"query": prefix, "mode": mode, "count": 0, "suggestions": [], "source": "none"}
 
     key = _ck(prefix, mode)
+    owner = cache.owner(key) if cache else None
     cached = cache.get(key) if cache else None
     if cached is not None:
+        event_log.emit("cache", f"HIT  {mode}:{prefix!r}", node=owner, prefix=prefix, mode=mode, status="hit")
         return {
             "query": prefix, "mode": mode, "count": len(cached),
-            "suggestions": cached, "source": "cache", "owner_node": cache.owner(key),
+            "suggestions": cached, "source": "cache", "owner_node": owner,
         }
 
+    event_log.emit("cache", f"MISS {mode}:{prefix!r} → trie", node=owner, prefix=prefix, mode=mode, status="miss")
     payload = _rank_enhanced(prefix) if mode == "enhanced" else _rank_basic(prefix)
     if cache is not None:
         ttl = CACHE_TTL_ENHANCED if mode == "enhanced" else CACHE_TTL_BASIC
@@ -225,13 +260,19 @@ def record_search(query: str) -> int:
     # Invalidate cached suggestion lists that could now be stale. Bumping
     # "iphone" can re-rank every prefix of it ("i","ip",...,"iphone") in BOTH
     # ranking modes, so we invalidate both namespaces. (TTL is the backstop.)
+    invalidated = 0
     if cache is not None:
         prefixes = []
         for i in range(1, len(norm) + 1):
             p = norm[:i]
             prefixes.append(_ck(p, "basic"))
             prefixes.append(_ck(p, "enhanced"))
-        cache.invalidate_prefixes(prefixes)
+        invalidated = cache.invalidate_prefixes(prefixes)
+    event_log.emit(
+        "search",
+        f"SEARCH {norm!r} → count {new_count}; invalidated {invalidated} cached prefix list(s)",
+        query=norm, count=new_count, invalidated=invalidated,
+    )
     return new_count
 
 
@@ -303,6 +344,15 @@ def batch_flush():
         return JSONResponse(status_code=503, content={"error": "batch_not_ready"})
     rows = batch.flush_now()
     return {"flushed_rows": rows, "stats": batch.stats()}
+
+
+@app.get("/events")
+def events(after_id: int = Query(default=0, ge=0, description="Return events with id > this")):
+    """Recent server activity (cache hit/miss, batch flushes, searches, recency
+    decay snapshots) for the UI's live activity log. Poll with the highest id you've
+    seen to get only new events."""
+    evs = event_log.since(after_id=after_id)
+    return {"events": evs, "latest_id": event_log.latest_id()}
 
 
 @app.get("/cache/debug")
