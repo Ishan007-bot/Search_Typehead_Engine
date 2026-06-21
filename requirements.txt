@@ -1,2 +1,5 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
+# Optional: only needed when running the cache on real Redis (USE_REDIS=1).
+# The default in-memory backend does not require this.
+redis==5.0.8

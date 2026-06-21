@@ -19,7 +19,7 @@ defend every major decision.
    │          │ ────────────────► │            hit │  │ miss                       │
    └──────────┘                   │   ┌────────────▼──▼─────────────────────┐     │
                                   │   │  Distributed cache (cache_cluster)   │     │
-                                  │   │  node-0   node-1   node-2  (TTL)     │     │
+                                  │   │  Redis-0  Redis-1  Redis-2 (TTL)     │     │
                                   │   └────────────┬─────────────────────────┘     │
                                   │          miss  │ ▲ populate                     │
                                   │   ┌────────────▼─┴─────────────────────┐       │
@@ -100,6 +100,20 @@ win at *read* time. That is exactly right for a read-heavy workload.
 Suggestion results are read constantly and change slowly. We cache the **finished
 result list per prefix**, so a hit returns with zero ranking work.
 
+### Where the cache lives — three real Redis nodes
+Each logical cache node is a **separate Redis process** (`redis-0/1/2` on ports
+6379/6380/6381, started by `docker-compose.yml`). This makes the cache *genuinely*
+distributed — independent processes the app routes between over TCP, not one
+in-process map. The split of responsibility is the key point:
+
+- **Our consistent-hash ring** (`ring.py`) decides *which node* owns a prefix.
+- **Redis** stores that node's cached suggestion lists and enforces TTL natively.
+
+So the graded, must-explain logic (the distribution) is code we wrote; Redis is
+just the storage behind each node. `redis_cache.py` and the (now-removed) earlier
+in-memory node share the same interface, which is why swapping the storage never
+touched the ring, routing, invalidation, or `/cache/debug`.
+
 ### Why consistent hashing (not `hash(key) % N`)
 The naive shard is `hash(key) % N`. It works until `N` changes — add or remove
 **one** cache node and `N` changes, so the mapping changes for **almost every
@@ -131,10 +145,11 @@ essential for a "distributed" cache where nodes must agree.
 
 ### Expiry **and** invalidation (belt and suspenders)
 - **Invalidation** keeps the cache correct right after a write we know about: a
-  search on `iphone` invalidates the cached lists for every prefix of it
-  (`i`, `ip`, …, `iphone`) in both ranking modes.
+  search on `weather` invalidates the cached lists for every prefix of it
+  (`w`, `we`, …, `weather`) in both ranking modes.
 - **TTL** is the safety net that bounds how stale *any* entry can get, even if a
-  write path ever misses a prefix. A background sweeper reclaims expired entries.
+  write path ever misses a prefix. Redis enforces TTL natively (per-key expiry),
+  so expired entries vanish on their own — no sweeper needed.
 
 ---
 
@@ -190,13 +205,15 @@ searching. *(Verified: a query moved past the window scores exactly 0.)*
 Blended scoring + wide re-rank is more CPU than a raw count sort — paid only on an
 enhanced-mode cache miss.
 
-### Demonstrated difference (sample data)
-After spiking `iphone holder` (count 15k) with 40 searches:
+### Demonstrated difference (real ORCAS data)
+For the prefix `weath`, the all-time leader is `weather` (~2.4k clicks). After
+spiking the lower-ranked sibling `weather.com` (~1k clicks) with a burst of
+searches:
 
-| Mode | #1 result | Why |
+| Mode | #1 result | Why (from the `enhanced` response's `count`/`recent` fields) |
 |---|---|---|
-| `basic` | `iphone` (100k) | all-time count wins |
-| `enhanced` | `iphone holder` | recency boost (blended 124 vs iphone's 5) |
+| `basic` | `weather` | all-time click count wins |
+| `enhanced` | `weather.com` | recency boost (blended ~306 vs `weather`'s ~156) |
 
 Same endpoint, same prefix → different #1. Basic ranking is unchanged, proving the
 two modes are genuinely different.
@@ -212,7 +229,7 @@ queries.
 
 ### The approach: buffer → aggregate → flush
 1. **Buffer**: each `/search` adds to an in-memory dict (no DB write).
-2. **Aggregate**: duplicates collapse — `8×"iphone"` → `{"iphone": 8}` = one row.
+2. **Aggregate**: duplicates collapse — `8×"weather"` → `{"weather": 8}` = one row.
 3. **Flush** (single transaction) on whichever fires first:
    - **size**: buffer holds ≥ `BATCH_SIZE` (50) distinct queries, or
    - **timer**: every `FLUSH_INTERVAL` (2s).
@@ -254,12 +271,15 @@ and the choke-point; M6 swaps the write *strategy* behind that choke-point."
 
 ## 8. Known limitations (honest scope)
 
-- **Single process.** The trie/cache/trending live in-process; the "distributed"
-  cache is N logical nodes in one app (exactly N Redis instances conceptually, but
-  in-memory). On multiple workers each would have its own trie; SQLite is the
-  shared truth and periodic rebuilds + cache TTL would reconcile them. This is the
-  right scope for a local demo and keeps every component explainable.
-- **Trie rebuild on startup** is O(rows); fine for the assignment dataset.
+- **Single app process (one trie).** The cache is genuinely distributed across
+  three separate Redis processes, but the *app* itself is one process — the trie
+  and trending state live in its memory. On multiple app workers each would have
+  its own trie; SQLite is the shared truth and periodic rebuilds + the shared Redis
+  cache would reconcile them. Right scope for a local demo.
+- **Trie rebuild on startup** is O(rows): ~8s for the 200k-query ORCAS dataset
+  (one-time boot cost). It's the deliberate price for fast reads — top-K is
+  precomputed once so every `/suggest` is single-digit ms. Could be amortized
+  (persist/lazy-build) at larger scale; fine for the assignment dataset.
 - **Recency state is in-memory** (not persisted) — by design; it's a live signal.
 
 ---

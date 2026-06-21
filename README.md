@@ -5,11 +5,13 @@ content platforms — built to showcase the **backend data-system design** rathe
 than just a UI. As you type a prefix, it returns the most popular matching queries
 in milliseconds; as people search, popularity updates and *trending* queries rise.
 
-The interesting parts are all under the hood and **hand-written so every decision
-is explainable** (no Redis, no external libraries doing the hard work):
+The interesting parts are all under the hood. The data structures and routing
+logic are **hand-written so every decision is explainable** — the consistent-hash
+ring, the trie, the batch writer are all ours, not a library doing the hard work:
 
 - a **trie** with precomputed top-K for sub-millisecond prefix lookups,
-- a **distributed cache** sharded with **consistent hashing** (virtual nodes),
+- a **distributed cache** across three real **Redis** nodes, sharded with a
+  hand-written **consistent-hashing** ring (virtual nodes),
 - **recency-aware ranking** that surfaces trending queries without letting old
   spikes dominate forever,
 - a **batch writer** that collapses thousands of searches into a handful of DB
@@ -42,7 +44,7 @@ is explainable** (no Redis, no external libraries doing the hard work):
 | Capability | Where it lives | One-line summary |
 |---|---|---|
 | Prefix suggestions, top-10 by popularity | `trie.py` | Walk to the prefix node, return its precomputed top-K. |
-| Distributed cache + consistent hashing | `ring.py`, `cache.py`, `cache_cluster.py` | Each prefix is owned by a cache node chosen on a hash ring. |
+| Distributed cache + consistent hashing | `ring.py`, `redis_cache.py`, `cache_cluster.py` | Each prefix is owned by a Redis node chosen on a hash ring. |
 | Search submission + count updates | `main.py`, `datastore.py` | `POST /search` returns a dummy response and bumps counts. |
 | Trending / recency-aware ranking | `trending.py` | Blends all-time popularity with time-decayed recent activity. |
 | Batch writes | `batch_writer.py` | Buffer → aggregate duplicates → flush in one transaction. |
@@ -52,26 +54,46 @@ is explainable** (no Redis, no external libraries doing the hard work):
 
 ## Quick start
 
-**Requirements:** Python 3.10+ (developed on 3.12). That's it — only FastAPI and
-uvicorn are installed; everything else is the standard library.
+The cache is backed by **three real, independent Redis nodes**, so the recommended
+way to run everything is Docker Compose — one command brings up the app and all
+three cache nodes together.
+
+**Requirements:** Docker + Docker Compose.
 
 ```bash
-# 1. install dependencies
-pip install -r requirements.txt
-
-# 2. load the dataset into SQLite (creates data/typeahead.db)
-python data/load_data.py --reset
-
-# 3. run the server (the UI is served at the root URL)
-python -m uvicorn app.main:app --reload
-
-# 4. open the app
-#    →  http://127.0.0.1:8000/
+docker compose up --build
+#  →  app + UI at http://localhost:8000/
+#  →  three Redis cache nodes on ports 6379 / 6380 / 6381
 ```
 
-> **Port already in use?** Run `python -m uvicorn app.main:app --port 8800` and
-> open `http://127.0.0.1:8800/`. (On some Windows setups port 8000 is taken by
-> another app.)
+The app's own **consistent-hash ring** decides which Redis node owns each prefix;
+Redis just stores that node's cached suggestion lists (with native TTL). Verify
+the cache is live:
+
+```bash
+curl "http://localhost:8000/cache/stats"     # "backend":"redis", 3 node endpoints
+```
+
+The dataset is loaded into SQLite automatically when the image builds.
+
+### Running without Docker (own Redis instances)
+
+If you'd rather run the app process directly, start three Redis servers yourself
+(ports 6379/6380/6381) and point the app at them:
+
+```bash
+pip install -r requirements.txt
+python data/load_data.py --reset
+REDIS_NODES=127.0.0.1:6379,127.0.0.1:6380,127.0.0.1:6381 \
+  python -m uvicorn app.main:app --port 8000
+#  →  http://127.0.0.1:8000/
+```
+
+> **Why three separate Redis nodes?** The assignment grades a *distributed* cache
+> using consistent hashing. Three independent Redis processes make the distribution
+> real (genuinely separate nodes the app routes between), while the routing logic —
+> the consistent-hash ring with virtual nodes — is ours and fully explainable. See
+> [ARCHITECTURE.md](ARCHITECTURE.md) §4.
 
 ---
 
@@ -81,38 +103,49 @@ A walkthrough that exercises every graded feature — good for a screen recordin
 a viva.
 
 **1. Suggestions ranked by popularity**
-Open the UI and type `iph`. The dropdown shows `iphone`, `iphone 15`,
-`iphone 15 pro`… ranked by search count, each with a popularity bar.
+Open the UI and type `weath`. The dropdown shows `weather`, `weather forecast`,
+`weather channel`, `weather.com`… ranked by real click count, each with a
+popularity bar.
 
 **2. The cache, live**
 Type the same prefix again. The badge in the dropdown header flips from
 `served from index` to **`served from cache`** — the second read was a cache hit.
 
 **3. Consistent hashing**
-Visit `http://127.0.0.1:8000/cache/debug?prefix=iph`. You'll see which node owns
-the prefix, its position on the ring, and how a sample of prefixes spreads across
-nodes. Try different prefixes (`sam`, `lap`, `head`) — they land on different nodes.
+Visit `http://127.0.0.1:8000/cache/debug?prefix=weath`. You'll see which Redis node
+owns the prefix, its position on the ring, and how a sample of prefixes spreads
+across nodes. Try different prefixes (`you`, `face`, `goog`) — they land on
+different nodes.
 
 **4. Search submission updates counts**
 In the UI, search a query (type it and press Enter). You get a "Searched" banner;
 the count is bumped immediately in suggestions.
 
 **5. Trending (recency beats raw popularity)**
-Search a *low-popularity* query many times — e.g. `iphone holder`. Then compare:
+For the prefix `weath`, all-time #1 is `weather`. Now repeatedly search a
+lower-ranked sibling to make it *trend* — e.g. fire `weather.com` ~100 times:
 ```bash
-curl "http://127.0.0.1:8000/suggest?q=i&mode=basic"     # #1 = iphone (all-time)
-curl "http://127.0.0.1:8000/suggest?q=i&mode=enhanced"  # #1 = iphone holder (just spiked)
+for i in $(seq 1 100); do
+  curl -s -X POST http://127.0.0.1:8000/search \
+       -H "Content-Type: application/json" -d '{"query":"weather.com"}' >/dev/null
+done
+curl "http://127.0.0.1:8000/suggest?q=weath&mode=basic"     # #1 = weather (all-time count)
+curl "http://127.0.0.1:8000/suggest?q=weath&mode=enhanced"  # #1 = weather.com (recent spike)
 ```
-Same endpoint, same prefix → different #1. The **Trending now** section in the UI
-reflects this too.
+Same endpoint, same prefix → different #1. The enhanced score blends
+`log10(count)` with a time-decayed recency boost, so a burst of recent searches
+lifts `weather.com` above the all-time leader. The `enhanced` results include the
+raw `count` and `recent` fields so you can see exactly why each item ranked where
+it did. As the spike ages out of the recency window, `weather.com` falls back down
+— the boost is temporary by design. The **Trending now** section reflects this too.
 
 **6. Batch writes (write reduction)**
 Fire a lot of searches, then inspect:
 ```bash
 curl "http://127.0.0.1:8000/batch/stats"
-# searches_enqueued: 3303, db_flushes: 9, write_reduction_ratio: 0.9973
+# e.g. searches_enqueued: 3000, db_flushes: 13, write_reduction_ratio: 0.9957
 ```
-Thousands of searches became single-digit DB transactions.
+Thousands of searches became a handful of DB transactions.
 
 ---
 
@@ -156,12 +189,13 @@ app/
   datastore.py       SQLite source of truth (query, count, last_searched_at)
   trie.py            in-memory prefix index with per-node cached top-K
   ring.py            consistent-hash ring (md5, virtual nodes)
-  cache.py           one cache node — TTL dict + hit/miss stats
-  cache_cluster.py   N cache nodes behind the ring + invalidation + stats
+  redis_cache.py     one cache node backed by a real Redis instance (+ TTL, stats)
+  cache_cluster.py   N Redis nodes behind the ring + invalidation + stats
   trending.py        recency tracking (time buckets) + decay-based blended score
   batch_writer.py    buffer → aggregate → flush (size/timer) + write metrics
 data/
-  queries.csv        sample e-commerce dataset (query,count)
+  queries.csv        the active dataset (query,count) — ORCAS top-200k
+  prepare_orcas.py   aggregate raw ORCAS click logs → top-N query,count CSV
   load_data.py       CSV → SQLite loader (normalizes columns; aggregates if needed)
 ui/
   index.html         single-page UI (debounce, dropdown, keyboard nav, trending)
@@ -176,26 +210,53 @@ PERFORMANCE.md       measured numbers + how to reproduce them
 
 ## Dataset
 
-**Source:** an e-commerce search-queries dataset (the kind published on Kaggle).
-The full Kaggle file is large and requires a login, so it is **not committed**. A
-small, representative sample lives in [`data/queries.csv`](data/queries.csv) in the
-exact same `query,count` schema, so the project runs **offline out of the box**.
+**ORCAS — real Bing search-query logs (Microsoft / TREC).**
+[ORCAS](https://microsoft.github.io/msmarco/ORCAS) (Open Resource for Click
+Analysis in Search) is **18.8 million real Bing query–click records**. It's the
+strongest possible fit for a *search* typeahead — these are literally search
+queries — with a clean provenance story: *frequency = how often a query's results
+were clicked.*
+
+The raw `orcas.tsv` is one row **per click** (`qid, query, did, url`), so we
+**derive per-query counts by aggregation** (how the assignment allows count-less
+datasets to be handled). [`data/prepare_orcas.py`](data/prepare_orcas.py)
+aggregates clicks per query, filters junk, and keeps the top-N:
+
+```bash
+# 1. download ORCAS (the "Click data" file, ~330 MB gz) from the link above
+#    https://microsoft.github.io/msmarco/ORCAS  →  orcas.tsv.gz  →  gunzip it
+# 2. aggregate 18.8M clicks → per-query frequency, keep the top 200k:
+python data/prepare_orcas.py /path/to/orcas.tsv --top 200000
+# 3. load into SQLite:
+python data/load_data.py --reset
+```
+
+This produced the active dataset: **200,000 queries**, e.g. `weather` (2,116
+clicks), `youtube`, `facebook`, `google maps`, `how to get a passport`. The prep
+script handles both ORCAS variants (the click-log form where frequency =
+rows-per-query, and any pre-counted form) and writes the `query,count` schema the
+loader expects — no other code changes.
+
+> **Running with Docker?** Re-run `prepare_orcas.py` + `load_data.py` to refresh
+> `data/queries.csv`, then `docker compose up --build` — the image loads the
+> dataset into SQLite at build time, so a rebuild is needed to pick up new data.
 
 **Schema** (the only thing the loader needs):
 
 ```csv
 query,count
-iphone,100000
-iphone 15,85000
-laptop,95000
+weather,2116
+mapquest,1412
+weather forecast,1239
+youtube,149
 ...
 ```
 
-**Loading the full Kaggle file (or any e-commerce CSV)** — the loader normalizes
-column names, so no code changes are needed:
+**Using a different CSV** (another ORCAS top-N, a Kaggle export, etc.) — the
+loader normalizes column names, so no code changes are needed:
 
 ```bash
-python data/load_data.py path/to/kaggle_file.csv --reset
+python data/load_data.py path/to/your_file.csv --reset
 ```
 
 - **Query column** is auto-detected from: `query, search_term, search_query,
@@ -224,19 +285,19 @@ Up to 10 prefix-matching suggestions.
 | `mode` | `basic` | `basic` = sort by all-time count · `enhanced` = recency-aware. |
 
 ```bash
-curl "http://127.0.0.1:8000/suggest?q=iph&mode=basic"
+curl "http://127.0.0.1:8000/suggest?q=weath&mode=basic"
 ```
 ```json
 {
-  "query": "iph",
+  "query": "weath",
   "mode": "basic",
   "count": 10,
   "suggestions": [
-    { "query": "iphone",    "score": 100261 },
-    { "query": "iphone 15", "score": 85002 }
+    { "query": "weather",          "score": 2369 },
+    { "query": "weather forecast", "score": 1239 }
   ],
   "source": "cache",
-  "owner_node": "cache-node-2"
+  "owner_node": "cache-node-0"
 }
 ```
 `source` is `cache` (hit), `trie` (miss → recomputed), or `none` (empty prefix).
@@ -249,10 +310,10 @@ Submit a search: returns the dummy response and records the query.
 
 ```bash
 curl -X POST http://127.0.0.1:8000/search \
-     -H "Content-Type: application/json" -d '{"query":"iphone"}'
+     -H "Content-Type: application/json" -d '{"query":"weather"}'
 ```
 ```json
-{ "message": "Searched", "query": "iphone", "count": 100262 }
+{ "message": "Searched", "query": "weather", "count": 2370 }
 ```
 New queries are inserted with an initial count; existing ones are incremented.
 The update is reflected in `/suggest` immediately and persisted via batching.
@@ -260,7 +321,7 @@ The update is reflected in `/suggest` immediately and persisted via batching.
 ### `GET /trending?limit=<n>`
 Top queries by recent (time-decayed) activity — independent of all-time count.
 ```json
-{ "trending": [ { "query": "iphone holder", "score": 40.0 } ], "window_seconds": 180 }
+{ "trending": [ { "query": "weather", "score": 1.0 } ], "window_seconds": 180 }
 ```
 
 ### `GET /cache/debug?prefix=<p>`
