@@ -206,6 +206,37 @@
       font-family: var(--mono); font-size: 11px; color: var(--ink);
     }
 
+    /* ---- Server activity log ---- */
+    .activity { margin-top: 36px; }
+    .activity h2 {
+      font-family: var(--mono); font-size: 11px; text-transform: uppercase;
+      letter-spacing: .12em; color: var(--ink-soft); margin: 0 0 12px;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .activity h2 .pulse {
+      width: 7px; height: 7px; border-radius: 50%; background: var(--teal);
+      animation: pulse 1.6s ease-in-out infinite;
+    }
+    @keyframes pulse { 0%,100% { opacity: .35; } 50% { opacity: 1; } }
+    .log {
+      background: #16140f; border: 1px solid var(--line-2); border-radius: var(--r);
+      font-family: var(--mono); font-size: 12px; line-height: 1.7;
+      padding: 12px 14px; height: 220px; overflow-y: auto; color: #d8d3c8;
+    }
+    .log .row { display: flex; gap: 10px; white-space: nowrap; }
+    .log .tag {
+      flex: none; width: 64px; text-transform: uppercase; font-size: 10px;
+      letter-spacing: .06em; padding-top: 1px;
+    }
+    .log .tag.cache   { color: #5aa0ff; }
+    .log .tag.batch   { color: #d98b3a; }
+    .log .tag.search  { color: #c98bff; }
+    .log .tag.recency { color: #3fb98a; }
+    .log .msg { color: #e7e3da; overflow: hidden; text-overflow: ellipsis; }
+    .log .msg .hit  { color: #3fb98a; font-weight: 700; }
+    .log .msg .miss { color: #e0894f; font-weight: 700; }
+    .log .empty { color: var(--ink-soft); }
+
     @media (prefers-reduced-motion: reduce) {
       *, *::before { animation: none !important; transition: none !important; }
     }
@@ -221,7 +252,7 @@
     <header>
       <span class="eyebrow"><span class="dot"></span>Live · ranked by search volume</span>
       <h1>Find it before you<br />finish <em>typing</em>.</h1>
-      <p>Start typing a product. Suggestions are ranked by how often shoppers search them.</p>
+      <p>Start typing a query. Suggestions are ranked by how often people search them.</p>
     </header>
 
     <div class="search-wrap">
@@ -232,7 +263,7 @@
           </svg>
         </span>
         <input id="search-input" type="text" autocomplete="off" spellcheck="false"
-               placeholder="Try “iphone”, “laptop”, “headphones”…"
+               placeholder="Try “weather”, “youtube”, “how to”…"
                role="combobox" aria-expanded="false" aria-controls="dropdown" aria-autocomplete="list" />
         <div class="spinner" id="spinner" aria-hidden="true"></div>
         <button id="search-btn">Search</button>
@@ -252,6 +283,13 @@
         Trending now
       </h2>
       <div class="chips" id="trending-chips"></div>
+    </section>
+
+    <section class="activity">
+      <h2><span class="pulse"></span>Server activity log</h2>
+      <div class="log" id="activity-log">
+        <div class="row"><span class="empty">Waiting for server activity…</span></div>
+      </div>
     </section>
 
     <footer>
@@ -461,8 +499,46 @@
       if (input.value.trim() && currentItems.length) showDropdown();
     });
 
+    // ---------- Server activity log (polls /events) ----------
+    const activityLog = document.getElementById("activity-log");
+    let lastEventId = 0;
+    let logCleared = false;
+
+    async function pollEvents() {
+      try {
+        const res = await fetch(`${API}/events?after_id=${lastEventId}`);
+        if (!res.ok) throw new Error("not ready");
+        const data = await res.json();
+        const evs = data.events || [];
+        if (evs.length) {
+          if (!logCleared) { activityLog.innerHTML = ""; logCleared = true; }
+          for (const ev of evs) appendEvent(ev);
+          lastEventId = data.latest_id;
+          // keep the DOM bounded (mirror the server's ring buffer)
+          while (activityLog.children.length > 100) activityLog.removeChild(activityLog.firstChild);
+          activityLog.scrollTop = activityLog.scrollHeight;
+        }
+      } catch (err) {
+        /* server not up yet — leave the placeholder */
+      }
+    }
+
+    function appendEvent(ev) {
+      const row = document.createElement("div");
+      row.className = "row";
+      // highlight HIT/MISS keywords inside cache messages
+      let msg = escapeHtml(ev.message);
+      msg = msg.replace(/\bHIT\b/g, '<span class="hit">HIT</span>')
+               .replace(/\bMISS\b/g, '<span class="miss">MISS</span>');
+      row.innerHTML = `<span class="tag ${escapeHtml(ev.category)}">${escapeHtml(ev.category)}</span>` +
+                      `<span class="msg">${msg}</span>`;
+      activityLog.appendChild(row);
+    }
+
     // Initial load.
     loadTrending();
+    pollEvents();
+    setInterval(pollEvents, 1000);   // 1s poll — cheap, and the demo feels live
     input.focus();
   </script>
 </body>
