@@ -1,8 +1,7 @@
 # Architecture & Design
 
-This document explains how the system is built, **why** each choice was made, the
-trade-offs involved, and a crib sheet for the viva. It is organized so you can
-defend every major decision.
+This document explains how the system is built, **why** each choice was made, and
+the trade-offs involved in each part of the design.
 
 ---
 
@@ -94,7 +93,7 @@ win at *read* time. That is exactly right for a read-heavy workload.
 
 ---
 
-## 4. Distributed cache + consistent hashing  *(the core 60% — most likely viva topic)*
+## 4. Distributed cache + consistent hashing
 
 ### Why a cache
 Suggestion results are read constantly and change slowly. We cache the **finished
@@ -109,8 +108,8 @@ in-process map. The split of responsibility is the key point:
 - **Our consistent-hash ring** (`ring.py`) decides *which node* owns a prefix.
 - **Redis** stores that node's cached suggestion lists and enforces TTL natively.
 
-So the graded, must-explain logic (the distribution) is code we wrote; Redis is
-just the storage behind each node. `redis_cache.py` and the (now-removed) earlier
+So the distribution logic is code we wrote; Redis is just the storage behind each
+node. `redis_cache.py` and the (now-removed) earlier
 in-memory node share the same interface, which is why swapping the storage never
 touched the ring, routing, invalidation, or `/cache/debug`.
 
@@ -153,11 +152,11 @@ essential for a "distributed" cache where nodes must agree.
 
 ---
 
-## 5. Trending — recency-aware ranking  *(20%)*
+## 5. Trending — recency-aware ranking
 
 The same `/suggest` endpoint supports two modes:
 
-- `mode=basic` — sort by all-time count (the 60% behavior).
+- `mode=basic` — sort by all-time count.
 - `mode=enhanced` — recency-aware blended score.
 
 ### (1) How recent searches are tracked
@@ -220,7 +219,7 @@ two modes are genuinely different.
 
 ---
 
-## 6. Batch writes  *(20%)*
+## 6. Batch writes
 
 ### The problem
 Writing SQLite synchronously on every `/search` = one transaction per submit.
@@ -238,12 +237,12 @@ queries.
 **3000 searches → 5 DB transactions = 99.83% fewer writes** (600 searches per
 transaction). See [PERFORMANCE.md](PERFORMANCE.md).
 
-### Why reads stay fresh despite deferred writes  *(subtle, worth raising)*
+### Why reads stay fresh despite deferred writes
 `record_search()` bumps the **trie synchronously** but **defers the SQLite write**.
 So `/suggest` reflects a search instantly (read model current) while the durable
 write is batched (throughput win). They reconcile because both apply the same `+1`.
 
-### Failure trade-off  *(the assignment explicitly wants this discussed)*
+### Failure trade-off
 - Buffered counts live in RAM.
 - **Graceful shutdown flushes them** (implemented & verified).
 - **A hard crash between flushes loses that batch** — counts undercount slightly
@@ -259,17 +258,17 @@ write is batched (throughput win). They reconcile because both apply the same `+
 
 ---
 
-## 7. The `record_search()` seam  *(the clean-layering point)*
+## 7. The `record_search()` seam
 
-All count updates funnel through one helper, `record_search()`. This is why M6's
-batch writer changed essentially one line of the write path
+All count updates funnel through one helper, `record_search()`. This keeps the
+write *strategy* swappable behind a single seam: moving from a synchronous SQLite
+write to the batched writer changed essentially one line of the write path
 (`store.apply_increments(...)` → `batch.enqueue(...)`) without touching the
-endpoint, the UI, or the response contract. "M3 establishes the update semantics
-and the choke-point; M6 swaps the write *strategy* behind that choke-point."
+endpoint, the UI, or the response contract.
 
 ---
 
-## 8. Known limitations (honest scope)
+## 8. Known limitations
 
 - **Single app process (one trie).** The cache is genuinely distributed across
   three separate Redis processes, but the *app* itself is one process — the trie
@@ -281,23 +280,3 @@ and the choke-point; M6 swaps the write *strategy* behind that choke-point."
   precomputed once so every `/suggest` is single-digit ms. Could be amortized
   (persist/lazy-build) at larger scale; fine for the assignment dataset.
 - **Recency state is in-memory** (not persisted) — by design; it's a live signal.
-
----
-
-## 9. Viva crib sheet (one-liners)
-
-- **Why a trie?** Read-heavy typeahead; precompute top-K per node, pay at write,
-  win at read.
-- **Why consistent hashing?** `hash%N` remaps ~all keys when N changes →
-  stampede; ring remaps only ~1/N. *Proof: 32.7% vs ~67% on node removal.*
-- **Why virtual nodes?** Even load with few physical nodes (measured 980–1028/3000).
-- **Why md5 over `hash()`?** Python salts `hash()` per process; ring must be stable.
-- **TTL vs invalidation?** Invalidation = correct after known writes; TTL = bound
-  staleness if a write is ever missed. Both.
-- **How does trending avoid permanent over-ranking?** Sliding window + decay →
-  recency weight → 0 once searching stops → falls back to historical rank.
-- **Why bump trie now but defer DB write?** Reads stay fresh; writes get batched.
-- **What if it crashes before a flush?** Lose ≤ one batch of counts; acceptable for
-  statistical popularity; WAL would fix it but re-adds per-write cost.
-- **Why funnel writes through `record_search()`?** One seam → swap write strategy
-  without changing the API.

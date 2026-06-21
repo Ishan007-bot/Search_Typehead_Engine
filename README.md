@@ -17,8 +17,9 @@ ring, the trie, the batch writer are all ours, not a library doing the hard work
 - a **batch writer** that collapses thousands of searches into a handful of DB
   writes.
 
-> **Measured:** ~4 ms p95 suggestion latency · 98% cache hit rate · 99.8% fewer DB
-> writes via batching · only ~1/N keys remapped when a cache node is added/removed.
+> **Measured (200k ORCAS queries, 3 real Redis nodes):** ~6.5 ms p95 suggestion
+> latency · ~97% cache hit rate · ~99.6% fewer DB writes via batching · only ~1/N
+> keys remapped when a cache node is added/removed.
 > Full report in [PERFORMANCE.md](PERFORMANCE.md).
 
 ---
@@ -27,13 +28,13 @@ ring, the trie, the batch writer are all ours, not a library doing the hard work
 
 - [What it does](#what-it-does)
 - [Quick start](#quick-start)
-- [Guided demo](#guided-demo-5-minutes)
+- [Screenshots](#screenshots)
 - [How it works](#how-it-works)
 - [Project layout](#project-layout)
 - [Dataset](#dataset)
 - [API reference](#api-reference)
 - [Measuring performance](#measuring-performance)
-- [Design docs & viva prep](#design-docs--viva-prep)
+- [Design docs](#design-docs)
 - [Rubric mapping](#rubric-mapping)
 - [Troubleshooting](#troubleshooting)
 
@@ -97,55 +98,22 @@ REDIS_NODES=127.0.0.1:6379,127.0.0.1:6380,127.0.0.1:6381 \
 
 ---
 
-## Guided demo (5 minutes)
+## Screenshots
 
-A walkthrough that exercises every graded feature — good for a screen recording or
-a viva.
+<!-- Replace these placeholders with real images saved under docs/screenshots/. -->
 
-**1. Suggestions ranked by popularity**
-Open the UI and type `weath`. The dropdown shows `weather`, `weather forecast`,
-`weather channel`, `weather.com`… ranked by real click count, each with a
-popularity bar.
+**Typeahead suggestions** — ranked dropdown as you type a prefix:
 
-**2. The cache, live**
-Type the same prefix again. The badge in the dropdown header flips from
-`served from index` to **`served from cache`** — the second read was a cache hit.
+![Typeahead suggestions](docs/screenshots/suggestions.png)
 
-**3. Consistent hashing**
-Visit `http://127.0.0.1:8000/cache/debug?prefix=weath`. You'll see which Redis node
-owns the prefix, its position on the ring, and how a sample of prefixes spreads
-across nodes. Try different prefixes (`you`, `face`, `goog`) — they land on
-different nodes.
+**Trending searches** — recency-ranked chips, independent of all-time popularity:
 
-**4. Search submission updates counts**
-In the UI, search a query (type it and press Enter). You get a "Searched" banner;
-the count is bumped immediately in suggestions.
+![Trending searches](docs/screenshots/trending.png)
 
-**5. Trending (recency beats raw popularity)**
-For the prefix `weath`, all-time #1 is `weather`. Now repeatedly search a
-lower-ranked sibling to make it *trend* — e.g. fire `weather.com` ~100 times:
-```bash
-for i in $(seq 1 100); do
-  curl -s -X POST http://127.0.0.1:8000/search \
-       -H "Content-Type: application/json" -d '{"query":"weather.com"}' >/dev/null
-done
-curl "http://127.0.0.1:8000/suggest?q=weath&mode=basic"     # #1 = weather (all-time count)
-curl "http://127.0.0.1:8000/suggest?q=weath&mode=enhanced"  # #1 = weather.com (recent spike)
-```
-Same endpoint, same prefix → different #1. The enhanced score blends
-`log10(count)` with a time-decayed recency boost, so a burst of recent searches
-lifts `weather.com` above the all-time leader. The `enhanced` results include the
-raw `count` and `recent` fields so you can see exactly why each item ranked where
-it did. As the spike ages out of the recency window, `weather.com` falls back down
-— the boost is temporary by design. The **Trending now** section reflects this too.
+**Cache routing (`/cache/debug`)** — which Redis node owns a prefix, hit/miss, and
+the even key distribution across nodes:
 
-**6. Batch writes (write reduction)**
-Fire a lot of searches, then inspect:
-```bash
-curl "http://127.0.0.1:8000/batch/stats"
-# e.g. searches_enqueued: 3000, db_flushes: 13, write_reduction_ratio: 0.9957
-```
-Thousands of searches became a handful of DB transactions.
+![Cache debug](docs/screenshots/cache-debug.png)
 
 ---
 
@@ -202,7 +170,7 @@ ui/
 bench/
   benchmark.py       latency p50/p95/p99, cache hit rate, write reduction
 README.md            this file
-ARCHITECTURE.md      diagram, design choices, trade-offs, viva crib sheet
+ARCHITECTURE.md      diagram, design choices, and trade-offs
 PERFORMANCE.md       measured numbers + how to reproduce them
 ```
 
@@ -380,12 +348,11 @@ Captured results and discussion: [PERFORMANCE.md](PERFORMANCE.md).
 
 ---
 
-## Design docs & viva prep
+## Design docs
 
 [ARCHITECTURE.md](ARCHITECTURE.md) is the deep dive: full architecture diagram,
 the reason behind every component, the trending scoring/windowing math, the
-batch-write failure trade-offs, known limitations, and a **viva crib sheet** of
-one-line answers to the design questions a reviewer is likely to ask.
+batch-write failure trade-offs, and known limitations.
 
 ---
 

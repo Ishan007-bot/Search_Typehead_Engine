@@ -12,10 +12,16 @@ data/*.db-journal
 data/*.db-wal
 data/*.db-shm
 
-# Large dataset files (the full Kaggle download is NOT committed;
-# only the small sample data/queries.csv is tracked)
+# Raw datasets are NOT committed — only the processed data/queries.csv is tracked.
+# (The raw ORCAS file is ~1.8 GB; regenerate queries.csv with prepare_orcas.py.)
+data/orcas.tsv
+data/orcas*.tsv
+data/*.tsv.gz
 data/*_full.csv
 data/kaggle*.csv
+
+# Private study notes — not part of the submission
+VIVA_NOTES.md
 
 # IDE / editor
 .vscode/
